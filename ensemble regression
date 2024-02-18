@@ -1,0 +1,1346 @@
+ # Load the necessary packages
+library(Lahman); library(baseballr); library(dplyr); library(zoo); library(readr); library(jsonlite); library(janitor); library(tidyr)
+
+# Function to get MLB game logs
+mlb_game_logs <- function(id, stat_group, year) {
+  url <- paste0("http://statsapi.mlb.com/api/v1/people/", id, "/stats?stats=gameLog,statSplits&group=", stat_group, "&season=", year, "&language=en")
+  resp <- url %>% baseballr:::mlb_api_call()
+  df <- jsonlite::fromJSON(jsonlite::toJSON(resp[['stats']]), flatten = TRUE)[[2]][[1]]
+  df <- df %>% 
+    janitor::clean_names() %>% 
+    tibble()
+  if("positions_played" %in% names(df)){
+    df <- df %>% 
+      unnest(positions_played) %>%
+      rename(position = abbreviation) %>%
+      select(-code, -name, -type)
+  }
+  df
+}
+
+# Chadwick Database for Player IDs
+chadwick <- chadwick_player_lu()
+chadwick <- chadwick %>% filter(mlb_played_last == 2023)
+mlbamID <- chadwick$key_mlbam
+
+# Read razzball data
+razzball <- read_csv("C:/Users/bradj/Downloads/razzball1.csv")
+FangraphsIDs_pitchers <- razzball %>%
+  filter(ESPN_POS %in% c("SP", "RP")) %>%
+  pull(MLBAMID)
+
+# Initialize an empty list to store the game logs for both players and pitchers
+game_logs <- list()
+game_logs_pitchers <- list()
+
+# Loop through each mlbamID for both players and pitchers
+for (id in mlbamID) {
+  print(paste("Processing ID:", id))
+  tryCatch({
+    if (id %in% FangraphsIDs_pitchers) {
+      pitcher_logs <- mlb_game_logs(id, "pitching", 2023)
+      game_logs_pitchers[[as.character(id)]] <- pitcher_logs
+    } else {
+      player_logs <- mlb_game_logs(id, "hitting", 2023)
+      game_logs[[as.character(id)]] <- player_logs
+    }
+  }, error = function(e) {
+    print(paste("Error for ID:", id, "Message:", e$message))
+  })
+}
+
+# Combine all the game logs into two separate data frames
+game_logs_df <- bind_rows(game_logs)
+game_logs_pitchers_df <- bind_rows(game_logs_pitchers)
+
+# Data transformation and renaming for position players
+game_logs_df <- game_logs_df %>%
+  mutate(`1B` = stat_hits - stat_doubles - stat_triples - stat_home_runs) %>%
+  mutate(fantasy_points = 
+           `1B` * 3 +
+           stat_doubles * 5 +
+           stat_triples * 8 +
+           stat_home_runs * 10 +
+           stat_rbi * 2 +
+           stat_runs * 2 +
+           stat_base_on_balls * 2 +
+           stat_hit_by_pitch * 2 +
+           stat_stolen_bases * 5) %>%
+  rename(
+    PlayerName = player_full_name,
+    Date = date,
+    Pos = position,
+    G = stat_games_played,
+    AB = stat_at_bats,
+    H = stat_hits,
+    HR = stat_home_runs,
+    R = stat_runs,
+    RBI = stat_rbi,
+    BB = stat_base_on_balls,
+    IBB = stat_intentional_walks,
+    SO = stat_strike_outs,
+    HBP = stat_hit_by_pitch,
+    SB = stat_stolen_bases,
+    CS = stat_caught_stealing,
+    AVG = stat_avg,
+    OBP = stat_obp,
+    SLG = stat_slg,
+    OPS = stat_ops,
+    `2B` = stat_doubles,
+    `3B` = stat_triples) %>%
+  filter(Pos != "P") %>%
+  arrange(PlayerName, Date) %>%
+  group_by(PlayerName) %>%
+  mutate(
+    fantasy_points_last = lag(fantasy_points, 1),
+    fantasy_points_last_3app = rollmean(lag(fantasy_points, 1), 3, fill = NA, align = "right"),
+    fantasy_points_last_5app = rollmean(lag(fantasy_points, 1), 5, fill = NA, align = "right"),
+    fantasy_points_last_10app = rollmean(lag(fantasy_points, 1), 10, fill = NA, align = "right"),
+    fantasy_points_season = cumsum(fantasy_points) / row_number()
+  )
+
+# Data transformation and renaming for pitchers
+game_logs_pitchers_df <- game_logs_pitchers_df %>%
+  rename(
+    G = stat_games_played,
+    GS = stat_games_started,
+    R = stat_runs,
+    HR = stat_home_runs,
+    SO = stat_strike_outs,
+    BB = stat_base_on_balls,
+    IBB = stat_intentional_walks,
+    H = stat_hits,
+    HBP = stat_hit_by_pitch,
+    Pitches = stat_number_of_pitches,
+    ERA = stat_era,
+    IP = stat_innings_pitched,
+    W = stat_wins,
+    L = stat_losses,
+    SV = stat_saves,
+    BS = stat_blown_saves,
+    ER = stat_earned_runs,
+    CG = stat_complete_games,
+    ShO = stat_shutouts,
+    Strikes = stat_strikes)
+
+# Convert IP to numeric
+game_logs_pitchers_df$IP <- as.numeric(as.character(game_logs_pitchers_df$IP))
+
+# Calculate fantasy points for pitchers
+game_logs_pitchers_df <- game_logs_pitchers_df %>%
+  mutate(fantasy_points = 
+           IP * 2.25 +
+           SO * 2 +
+           W * 4 +
+           ER * -2 +
+           H * -0.6 +
+           BB * -0.6 +
+           HBP * -0.6 +
+           CG * 2.5 +
+           ShO * 2.5) %>%
+  arrange(player_full_name, date) %>%
+  group_by(player_full_name) %>%
+  mutate(
+    fantasy_points_last = lag(fantasy_points, 1),
+    fantasy_points_last_3app = rollmean(lag(fantasy_points, 1), 3, fill = NA, align = "right"),
+    fantasy_points_last_5app = rollmean(lag(fantasy_points, 1), 5, fill = NA, align = "right"),
+    fantasy_points_last_10app = rollmean(lag(fantasy_points, 1), 10, fill = NA, align = "right"),
+    fantasy_points_season = cumsum(fantasy_points) / row_number()
+  )
+
+# Write the final dataframes to CSV files
+write.csv(game_logs_df, "C:/Users/bradj/Documents/season_history.csv", row.names = FALSE)
+write.csv(game_logs_pitchers_df, "C:/Users/bradj/Documents/Season_history_pitchers.csv", row.names = FALSE)
+
+# Team Performance: The performance of a player's team can often impact individual player performance. For example, if a team has been on a winning streak, their players might be more likely to perform well. Streaks done but need to do statistical performance too.
+
+# main df - merged_data (position players), pitcher_final_df_final (pitchers)
+
+library(dplyr)
+library(baseballr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(lubridate)
+
+# Function to fetch and prepare player data
+prepare_data <- function(start_date, end_date, type = "batter") {
+  data_func <- if (type == "batter") daily_batter_bref else daily_pitcher_bref
+  data <- data_func(start_date, end_date) %>%
+    mutate(Full_Team_Name = case_when(
+      Team == "New York" ~ paste(Team, Level),
+      TRUE ~ Team
+    )) %>%
+    select(Name, Full_Team_Name, bbref_id)
+  return(data)
+}
+
+# Get data for all batters and pitchers
+player_data_recent <- prepare_data("2023-06-01", "2023-09-01", "batter")
+pitcher_data_recent <- prepare_data("2023-06-01", "2023-09-01", "pitcher")
+all_players_recent <- rbind(player_data_recent, pitcher_data_recent)
+
+# Date operations
+today <- Sys.Date() # Assuming you need only date part
+date_et <- as.Date(format(today, tz="America/New_York"), tz="America/New_York") - 150
+
+# Get the standings data for date_et
+get_standings <- function(season, date, league_id) {
+  mlb_standings(season = season, date = date, standings_type = "regularSeason", league_id = league_id) %>%
+    mutate(team_streak = if_else(team_records_streak_streak_type == "wins", team_records_streak_streak_number, -team_records_streak_streak_number)) %>%
+    select(team_records_team_name, team_records_run_differential, team_streak)
+}
+
+standingsAL <- get_standings(2023, date_et, 103)
+standingsNL <- get_standings(2023, date_et, 104)
+standings <- rbind(standingsAL, standingsNL)
+
+# Assuming team_mapping is already defined as shown
+# Join operations streamlined
+all_players_recent <- all_players_recent %>%
+  left_join(standings %>% left_join(team_mapping, by = c("team_records_team_name" = "WholeName")), 
+            by = c("Full_Team_Name" = "CityName"))
+
+# Remove the now redundant City_Name column
+all_players_recent <- all_players_recent %>%
+  select(-"team_records_team_name")
+# added team_streak and team_run_differential factors
+#Opponent Performance: Similarly, the performance of the opposing team can also impact player performance. Teams with strong defenses, for example, might be more likely to limit the scoring of opposing players.
+
+schedule <- mlb_schedule(season = 2023, level_ids = "1")
+todays_games <- subset(schedule, date == date_et)
+teams_playing <- data.frame(
+  Home = todays_games$teams_home_team_name,
+  Away = todays_games$teams_away_team_name
+)
+
+# Map the home team names
+teams_playing <- merge(teams_playing, team_mapping, by.x = "Home", by.y = "WholeName", all.x = TRUE)
+
+# Rename the CityName column to HomeCity
+colnames(teams_playing)[colnames(teams_playing) == "CityName"] <- "HomeCity"
+
+# Remove the old Home column
+teams_playing$Home <- NULL
+
+# Repeat for the away teams
+teams_playing <- merge(teams_playing, team_mapping, by.x = "Away", by.y = "WholeName", all.x = TRUE)
+colnames(teams_playing)[colnames(teams_playing) == "CityName"] <- "AwayCity"
+teams_playing$Away <- NULL
+
+
+# First, merge the two data frames
+joined_df <- merge(all_players_recent, teams_playing, by.x = "Full_Team_Name", by.y = "HomeCity", all.x = TRUE)
+
+# Then, create a new column "opponent_today" based on the conditions
+joined_df$opponent_today <- ifelse(!is.na(joined_df$AwayCity), 
+                                   joined_df$AwayCity, 
+                                   NA)
+
+# For those rows where Full_Team_Name did not appear in HomeCity, fill in the NA values with the corresponding HomeCity from AwayCity
+remaining_teams <- merge(all_players_recent, teams_playing, by.x = "Full_Team_Name", by.y = "AwayCity", all.x = TRUE)
+
+joined_df$opponent_today[is.na(joined_df$opponent_today)] <- remaining_teams$HomeCity[is.na(joined_df$opponent_today)]
+
+joined_df <- joined_df %>%
+  select(-AwayCity)
+
+joined_df <- joined_df %>%
+  left_join(select(all_players_recent, Full_Team_Name, team_records_run_differential,team_streak), 
+            by = c("opponent_today" = "Full_Team_Name")) %>%
+  replace_na(list(team_records_run_differential = 0, team_streak = "N/A"))
+
+joined_df <- rename(joined_df, 
+                    team_run_differential = team_records_run_differential.x,
+                    team_streak = team_streak.x,
+                    opponent_run_differential = team_records_run_differential.y,
+                    opponent_streak = team_streak.y)
+
+#Add homeawayteam column
+joined_df$HomeAwayToday <- ifelse(joined_df$Full_Team_Name %in% teams_playing$HomeCity, "Home", 
+                                  ifelse(joined_df$Full_Team_Name %in% teams_playing$AwayCity, "Away", NA))
+
+
+# Break up joined_df into position/player df
+pitcher_names <- unique(pitcher_data_recent$Name)
+player_names <- unique(player_data_recent$Name)
+
+# Create a dataframe only containing pitchers/position players
+pitcher_df <- joined_df[joined_df$Name %in% pitcher_names, ]
+pitcher_df <- distinct(pitcher_df)
+player_df <- joined_df[joined_df$Name %in% player_names, ]
+
+# Get mlbamid for pitcher_df
+razzball <- read_csv("C:/Users/bradj/Downloads/razzball.csv")
+
+razzball_filtered <- razzball %>% filter(ESPN_POS %in% c("SP", "RP"))
+pitcher_df <- merge(pitcher_df, razzball_filtered, by = "Name")
+pitcher_df <- rename(pitcher_df, mlbamid_pitcher = MLBAMID)
+pitcher_df <<- pitcher_df %>% select(-c(10,12,13,16))
+
+View(pitcher_df)
+View(player_df)
+
+#added opponent_streak, opponent_run_differential, and HomeAwayToday
+
+# Batter/Pitcher Matchups and Streaks: Specific matchups between batters and pitchers, including recent performance streaks, can influence the outcome. Some batters may perform better against certain pitchers and vice versa. Additionally, a batter may be more likely to perform well against a pitcher who is on a cold streak, and a pitcher may be more likely to perform well against a batter on a cold streak.
+probables <- get_game_pks_mlb(date_et, level_ids = c(1))
+games_df <- probables %>%
+  select(game_pk, away_team = teams.away.team.name, home_team = teams.home.team.name) %>%
+  distinct()
+
+games_df_playing <- merge(games_df, team_mapping, by.x = "away_team", by.y = "WholeName", all.x = TRUE)
+games_df_playing <- rename(games_df_playing, AwayTeamFullName = CityName)
+games_df_playing <- merge(games_df_playing, team_mapping, by.x = "home_team", by.y = "WholeName", all.x = TRUE)
+games_df_playing <- rename(games_df_playing, HomeTeamFullName = CityName)
+games_df_playing <- select(games_df_playing, -c(home_team, away_team))
+
+results_df <- map_df(probables$game_pk, get_probables_mlb)
+results_df <- merge(results_df, team_mapping, by.x = "team", by.y = "WholeName", all.x = TRUE)
+results_df <- rename(results_df, Team = CityName)
+results_df <- select(results_df, -c(team))
+results_df <- select(results_df, -c(home_plate_id, home_plate_full_name))
+probables_df<-results_df
+
+
+# Select only the necessary columns from probables_df
+probables_df_select <- select(probables_df, "Team", "fullName")
+
+# Perform the left join
+player_df <- left_join(player_df, probables_df_select, by = c("opponent_today" = "Team"))
+player_df <- rename(player_df, Probable_Starter = fullName)
+
+# Need to add stats of each player vs the probable starter next
+all_stats_2023 <- mlb_stats(stat_type = 'season', stat_group = 'hitting', season = 2023)
+
+razzball_filtered2 <- razzball %>% filter(!(ESPN_POS %in% c("SP", "RP")))
+player_df_test <- merge(player_df, razzball_filtered2, by = "Name")
+
+player_df_test <- rename(player_df_test, mlbamid_pos = MLBAMID)
+
+player_df_test <- merge(player_df_test, razzball, by.x = "Probable_Starter", by.y = "Name")
+player_df_test <- rename(player_df_test, mlbamid_pitcher = MLBAMID)
+player_df_test <- distinct(player_df_test)
+player_df_test <- select(player_df_test, -c('#.x', '#.y'))
+
+
+#### Get matchup stats from statball
+# Read the CSV file with headers
+data <- read_csv("C:/Users/bradj/OneDrive/Desktop/BvP.csv")
+
+# Splitting the data into columns
+# split_data <- strsplit(data$V1, ",")
+
+# Creating a data frame with separate columns
+#processed_data <- do.call(rbind, lapply(split_data, function(x) data.frame(t(x), stringsAsFactors = FALSE)))
+
+# Assigning the first row as column headers and removing it from the dataset
+#colnames(processed_data) <- processed_data[1, ]
+#processed_data <- processed_data[-1, ]
+
+# Split full_names into first and last names
+names_split <- strsplit(player_df_test$Name, " ")
+
+# Extract the first letter of the first name and the last name
+first_initial <- sapply(names_split, function(x) substr(x[1], 1, 1))
+last_name <- sapply(names_split, function(x) x[length(x)])
+
+# Combine the first initial, period, space, and last name
+player_df_test$transformed_names <- paste0(first_initial, ". ", last_name)
+
+# Rename columns in processed_data with prefix "matchup_"
+new_column_names <- paste0("matchup_", colnames(data))
+colnames(data) <- new_column_names
+
+# Joining player_df_test and processed_data based on transformed_names
+merged_data <- merge(player_df_test, data, by.x = "transformed_names", by.y = "matchup_Batter", all.x = TRUE)
+
+# Replace missing values with 0
+merged_data[is.na(merged_data)] <- 0
+
+# Specify the columns to convert to numeric
+cols_to_convert <- c("matchup_H", "matchup_2B", "matchup_3B", "matchup_HR", "matchup_RBI", "matchup_BB", "matchup_SO", "matchup_IBB", "matchup_HBP", "matchup_AB")
+
+# Convert the columns to numeric
+merged_data <- merged_data %>%
+  mutate_at(vars(cols_to_convert), as.numeric)
+
+# Add the matchup_1B column
+merged_data <- merged_data %>%
+  mutate(matchup_1B = matchup_H - matchup_2B - matchup_3B - matchup_HR)
+
+# Move the matchup_1B column to position 29
+merged_data <- merged_data %>%
+  relocate(matchup_1B, .before = 30)
+
+# Add the matchup_FPscored_perPA column
+merged_data <- merged_data %>%
+  mutate(matchup_FPscored_perPA = ifelse(matchup_AB == 0, NA, (matchup_1B * 3 + matchup_2B * 5 + matchup_3B * 8 + matchup_HR * 10 + matchup_RBI * 2 + matchup_BB * 2 - matchup_SO * 2 + matchup_IBB * 2 + matchup_HBP * 0.6) / matchup_AB))
+
+# Drop specified columns from merged_data
+columns_to_drop <- c(5,13,14,17,19,20,23,25,40,41,42,43,44,45)
+merged_data <- subset(merged_data, select = -columns_to_drop)
+
+# Player recent performance
+library(zoo)
+########### possibly store/append player data in this loop to speed up?
+# Loop over all players in the merged_data dataframe
+for (i in 1:nrow(merged_data)) {
+  # Get the player's ID
+  playerid <- merged_data$mlbamid_pos[i]
+  
+  # Reset the variables
+  last_game <- NA
+  last_3_games <- NA
+  last_10_games <- NA
+  last_20_games <- NA
+  last_50_games <- NA
+  
+  # Try to get data for the player
+  player_data <- tryCatch(
+    statcast_search(start_date = "2023-04-01", end_date = "2023-07-01", playerid = playerid),
+    error = function(e) NULL
+  )
+  
+  # If valid data was found, calculate the desired statistics
+  if (!is.null(player_data)) {
+    last_game <- mean(player_data$delta_home_win_exp, 1)
+    last_3_games <- mean(tail(player_data$delta_home_win_exp, 3))
+    last_10_games <- mean(tail(player_data$delta_home_win_exp, 10))
+    last_20_games <- mean(tail(player_data$delta_home_win_exp, 20))
+    last_50_games <- mean(tail(player_data$delta_home_win_exp, 50))
+  }
+  
+  # Add the statistics to the merged_data dataframe
+  merged_data$last_game[i] <- last_game
+  merged_data$last_3_games[i] <- last_3_games
+  merged_data$last_10_games[i] <- last_10_games
+  merged_data$last_20_games[i] <- last_20_games
+  merged_data$last_50_games[i] <- last_50_games
+}
+
+View(merged_data)
+
+## Player Performance vs Opp!
+
+# Initialize an empty data frame to store the results
+results2_df <- data.frame()
+
+# Loop over each team in your dataframe
+for (team in unique(player_df_test$Full_Team_Name)) {
+  # Get the MLBAMID of the probable starter for this team
+  pitcher_mlbamid <- unique(player_df_test$mlbamid_pitcher[player_df_test$Full_Team_Name == team])
+  
+  # Initialize variables to store the total sum of delta_home_win_exp
+  total_delta_home_win_exp <- 0
+  total_delta_home_win_exp_rest_of_league <- 0
+  
+  # Loop over each year
+  for (year in 2018:as.integer(format(as.Date("2023-09-01"), "%Y"))) {
+    # Get the pitcher's stats for this year
+    year_stats <- statcast_search(start_date = paste0(year, "-01-01"), end_date = paste0(year, "-12-31"), playerid = pitcher_mlbamid, player_type = 'pitcher')
+    
+    # Convert year_stats to a regular data frame and filter to only include at-bats against the team
+    year_stats <- as.data.frame(year_stats)
+    # Merge the data frames
+    year_stats <- merge(year_stats, player_df_test[, c("mlbamid_pos", "Full_Team_Name")], by.x = "batter", by.y = "mlbamid_pos", all.x = TRUE)
+    
+    # Add the sum of delta_home_win_exp for non-null events to the total
+    total_delta_home_win_exp <- total_delta_home_win_exp + sum(year_stats$delta_home_win_exp[year_stats$Full_Team_Name == team & !is.na(year_stats$events)], na.rm = TRUE)
+    
+    # Add the sum of delta_home_win_exp for non-null events against the rest of the league to the total
+    total_delta_home_win_exp_rest_of_league <- total_delta_home_win_exp_rest_of_league + sum(year_stats$delta_home_win_exp[year_stats$Full_Team_Name != team & !is.na(year_stats$events)], na.rm = TRUE)
+  }
+  
+  # Add the results to the results data frame
+  results2_df <- rbind(results2_df, data.frame(team = team, mlbamid_pitcher = pitcher_mlbamid, total_delta_home_win_exp = total_delta_home_win_exp, total_delta_home_win_exp_rest_of_league = total_delta_home_win_exp_rest_of_league))
+}
+
+# Join pitcher_df to results2_df to get all pitcher data together
+pitcher_final_df <- left_join(results2_df, pitcher_df, by = "mlbamid_pitcher")
+
+View(pitcher_final_df)
+
+# start of pitcher df, adding win exp deltas for matchup and vs league as baseline, added streaks too
+
+```
+
+```{r}
+#  Need to add matchup stats for pitchers in pitcher_df 
+
+# First, drop the unnecessary columns
+processed_data2 <- data %>% select(-c(2, 3, 13, 14, 15, 16, 17, 18, 21, 22))
+
+# Convert columns 3-12 to numeric
+processed_data2 <- processed_data2 %>%
+  mutate_at(vars(2:12), as.numeric)
+
+
+# Then, group by matchup_pitcher and sum the other columns
+processed_data_summed <- processed_data2 %>%
+  group_by(matchup_Pitcher) %>%
+  summarise(across(everything(), sum, na.rm = TRUE))
+
+# Add the matchup_1B column
+processed_data_summed <- processed_data_summed %>%
+  mutate(matchup_1B = matchup_H - matchup_2B - matchup_3B - matchup_HR)
+
+#  Add the FP_Against_perPA column
+processed_data_summed <- processed_data_summed %>%
+  mutate(FP_Against_perPA = (matchup_1B * 3 + matchup_2B * 5 + matchup_3B * 8 + matchup_HR * 10 + matchup_RBI * 2 + matchup_BB * 2 - matchup_SO * 2 + matchup_IBB * 2 + matchup_HBP * 0.6) / matchup_AB)
+#####
+# Split full_names into first and last names
+names_split <- strsplit(pitcher_final_df$Name, " ")
+
+# Extract the first letter of the first name and the last name
+first_initial <- sapply(names_split, function(x) substr(x[1], 1, 1))
+last_name <- sapply(names_split, function(x) x[length(x)])
+
+# Combine the first initial, period, space, and last name
+pitcher_final_df$transformed_names <- paste0(first_initial, ". ", last_name)
+
+# Joining pitcher_final_df and processed_data based on transformed_names
+pitcher_final_df_final <- merge(pitcher_final_df, processed_data_summed, by.x = "transformed_names", by.y = "matchup_Pitcher", all.x = TRUE)
+
+
+View(pitcher_final_df_final)
+
+# Added Pitcher matchup stats and fantasy point/PA for matchups
+
+```
+
+
+
+```{r}
+# Rename the column
+merged_data <- merged_data %>%
+  rename(position_player = Name)
+
+# Remove columns by index
+cols_to_remove <- c(1, 2, 4, 7, 12:18, 20:27)
+merged_data <- merged_data %>%
+  select(-cols_to_remove)
+
+cols_to_remove1 <- c(1, 2, 8 , 15, 17)
+pitcher_final_df_final <- pitcher_final_df_final %>%
+  select(-cols_to_remove1)
+pitcher_final_df_final <- pitcher_final_df_final %>%
+  select(Name, 1:3, everything())
+
+write.csv(pitcher_final_df_final, "C:/Users/bradj/Documents/pitchers.csv", row.names = FALSE)
+write.csv(merged_data, "C:/Users/bradj/Documents/position_players.csv", row.names = FALSE)
+
+
+```
+
+
+
+
+```{r}
+# Weather: Factors such as temperature, humidity, wind speed and direction, and precipitation can all affect how a game is played and the resulting player statistics.
+# park factors
+# Player Exposure: How commonly a player is being used in other lineups. If your model identifies a player who is expected to perform well but is not commonly used in other lineups (low exposure), this could give you a unique advantage in your contest.
+# Betting Odds: The odds set by betting markets can provide valuable information about expected team and player performance. If a team is favored to win, their players may be more likely to perform well. Similarly, a low over/under for a game might suggest a lower scoring game, which could impact the performance of position players and pitchers.
+# Rookie Status/Recent Major League Experience: Players with very little stats accumulated this year might be rookies or coming off injury or just not ready for competition, or a bench player.
+# Days Rest: The number of days since a player's last game can also impact their performance. NOTE - may be conflated with just picking players who don't play much. Would need to control for "regulars"
+#Injury Status: Injuries can significantly impact player performance. May be in the DK API
+
+# =============================================================================
+# predict MLB fantasy points
+#
+# deliverables:
+# (1) R script
+# (2) fantasy forecasts for latest game
+# (3) historical rolling performance of model(s)
+#
+#
+# TO DO
+# 1 - range of thresholds >> look at distribution
+# 2 - generate historical time series from inception
+# 3 - execute for players + pitchers
+# =============================================================================
+
+
+library(readr) # library to read CSV
+library(dplyr) 
+library(tidyr)
+library(data.table)
+library(forecast)
+library(zoo)
+# library(ggplot2) -- this conflicts w dplyr
+
+
+# =============================================================================
+# input parameters
+# =============================================================================
+
+file_input_path <- "C:/Users/bradj/Documents/"
+file_output_path <- "C:/Users/bradj/Documents/"
+
+
+player_type = "position"  # ["position","pitcher"]
+
+# =============================================================================
+# clean historical data
+# =============================================================================
+
+if (player_type == "position") {
+  file_today = "position_players"
+  file_hist = "season_history"
+} 
+if (player_type == "pitcher") {
+  file_today = "pitchers"
+  file_hist = "season_history_pitchers"
+}
+
+
+df_today = read_csv(paste(file_input_path, paste(file_today, ".csv", sep=""), sep=""))
+df = read_csv(paste(file_input_path, paste(file_hist, ".csv", sep=""), sep=""))
+
+
+df$PlayerName = gsub(".","",df$PlayerName, fixed=TRUE)  # replace periods in player names (e.g. A.J. > AJ) for mapping historical to current
+#df$date = as.POSIXct(df$date, format = "%m/%d/%Y")  # convert date columns from text to date variable type
+#df$date = as.Date(df$date)
+df = df %>% drop_na("Date")
+df = df[with(df, order(PlayerName, Date)),]  # sort game date by chronological order
+df = df[!duplicated(df[c("PlayerName","Date")], fromLast=TRUE),]  # remove dupes - keep last (restatement?)
+df = df %>% select(-contains("fantasy_points_last"))  # remove fantasy_points_last columns (lags added later in script)
+
+# remove non-starting players
+if (player_type == "position") {
+  df = subset(df, df$AB != 0)
+  df = df[!grepl("PH", df$Pos), ]
+  df = df[!grepl("DH", df$Pos), ]
+} 
+if (player_type == "pitcher") {
+  df = subset(df, (df$W + df$L) != 0)
+  df = subset(df, df$IP > 1)
+}
+
+# get distribution of fantasy_points to inform threshold
+deciles = quantile(df$fantasy_points, probs = seq(.1, .9, by = .1), na.rm=TRUE)
+
+pct_60 = deciles[6]
+pct_80 = deciles[8]
+threshold_range = seq(pct_60, pct_80, by=1)
+
+# POSITION PLAYERS:
+# 10% 20% 30% 40% 50% 60% 70% 80% 90% 
+# 0   0   2   3   5   7   9  12  17 
+
+# PITCHERS:
+# 10% 20% 30% 40% 50% 60% 70% 80% 90% 
+
+# =============================================================================
+# add relevant features
+# =============================================================================
+
+# add days since last game
+df = df %>%
+  group_by(PlayerName) %>%
+  mutate(days_off = difftime(Date, lag(Date, default=first(Date)), unit="day")) %>%
+  ungroup()
+
+df$days_off = replace(df$days_off, df$days_off < 1, NA)  # replace first game w NA
+df$days_off = as.integer(df$days_off)  # convert days to integer
+df$game_count = ave(seq_len(nrow(df)), df$PlayerName, FUN=seq_along)  # add game counter
+
+
+# columns for predictive model
+
+attribute_cols = c("PlayerName","Date")
+
+if (player_type == "position") {
+  model_cols = c("days_off","RBI","fantasy_points","fantasy_points_season")  # removed fp_bucket, "exit_velocity","soft_hits","Pitches","Balls","GDP"
+} 
+if (player_type == "pitcher") {
+  model_cols = c("CG","IP","SO","Strikes","batting_avg_on_balls_in_play","soft_hits", "tERA","fantasy_points","fantasy_points_season")
+}
+
+df = df[, c(attribute_cols, model_cols)]
+
+
+# add fantasy points for next game
+df = df %>%
+  group_by(PlayerName) %>%
+  mutate(fantasy_points_next = lead(fantasy_points, default=first(fantasy_points)))
+
+
+
+# replace fantasy_points_next / fp_bucket_next for last game of each player w NA (this is what we are predicting)
+df = df %>%
+  group_by(PlayerName) %>%
+  mutate(fantasy_points_next=c(fantasy_points_next[-n()], NA))
+
+for (t in threshold_range) {
+  
+  print(paste("threshold: ", t, Sys.time()))
+  
+  
+  # create fantasy point buckets
+  df$fp_bucket_next = 0
+  df$fp_bucket_next[df$fantasy_points_next >= t] = 1
+  
+  
+  
+  # =============================================================================
+  # add moving averages
+  # =============================================================================
+  
+  df_backup = data.frame(df)
+  df = data.frame(df_backup)
+  
+  ma_periods = c(7)
+  
+  # Add moving averages and ensure they are assigned back to df
+  for (i in model_cols) {
+    for (x in ma_periods) {
+      ma_col_name <- paste(i, "_ma", x, sep="")
+      print(ma_col_name)
+      
+      if (!ma_col_name %in% names(df)) {
+        df <- df %>%
+          group_by(PlayerName) %>%
+          mutate(!!ma_col_name := rollmean(get(i), k = x, fill = NA, align = 'right')) %>%
+          ungroup()
+      }
+    }
+  }
+
+  # Ensure that groupby_cols are correctly defined
+  groupby_cols <- c()
+  for (i in model_cols) {
+    for (x in ma_periods) {
+      ma_col_name <- paste(i, "_ma", x, sep="")
+      if (ma_col_name %in% names(df)) {
+        groupby_cols <- c(groupby_cols, ma_col_name)
+      } else {
+        warning(paste("Column does not exist:", ma_col_name))
+      }
+    }
+  }
+  
+  # =============================================================================
+  # ensemble regression
+  # =========================================================================
+  
+  y_var = "fp_bucket_next"  ## OR [fantasy_points_next, fp_bucket_next]
+  
+  # time series cross validation set of dates for backtest
+  season_opening_date = min(df$Date)
+  season_closing_date = max(df$Date)
+  total_games = as.integer(season_closing_date - season_opening_date)
+  
+  # partition number of time series cross validation iterations based on position type (optimize computational expense)
+  if (player_type == "position") {
+    num_iterations = 10
+  } 
+  if (player_type == "pitcher") {
+    num_iterations = 40
+  }
+  
+  min_days = total_games - num_iterations
+  
+  # performance df build, to be filled during ensemble iterations
+  performance_cols = c(c("PlayerName", "Date"), y_var)
+  performance_df = data.frame(matrix(nrow=0, ncol=length(c(performance_cols, 'predicted_value'))))
+  
+  reg_model_cols = c("adj_R2", "RSE")
+  reg_model_df = data.frame()
+  
+  
+  
+  while (min_days < total_games) {
+    
+    print(paste("min_days:", min_days, " | ", Sys.time()))
+    train_cutoff = season_opening_date + min_days
+    
+    train_df = df[df$Date <= train_cutoff, ]
+    test_df = df[df$Date == train_cutoff + 1, ]  # add 1 for test set
+    
+    if (nrow(test_df) == 0) {
+      print("skipping")  # if no games on day then continue to next day
+      min_days = min_days + 1
+      next
+    }  
+    
+    
+    # =========================================================================
+    # ensemble permutations
+    # =========================================================================
+    
+    N = length(model_cols)
+    vec = c(0, 1)
+    lst = lapply(numeric(N), function(x) vec)
+    ma_combos = data.frame(as.matrix(expand.grid(lst)))
+    
+    # ma_periods
+    for (k in c(1, ma_periods)) {
+      print(paste("ma_", k, sep=""))
+      
+      colnames(ma_combos) = model_cols
+      
+      if (k != 1) {
+        colnames(ma_combos) = paste(model_cols, "_ma", k, sep="")
+      }
+      
+      ma_combos = ma_combos %>% 
+        rowwise %>% 
+        filter(sum(c_across(where(is.numeric))) > 3) %>%
+        ungroup
+      
+      # =========================================================================
+      # iterate thru permutations to build regression ensemble
+      # =========================================================================
+      
+      for (j in c(1:nrow(ma_combos))) {  
+        
+        #print(paste("min_days:", min_days, " | ", j, "out of", nrow(ma_combos)))
+        
+        # prep for regression
+        
+        reg_vars = unlist(as.list(which(ma_combos[j,] == 1, arr.ind=TRUE)[, 'col'])) # get col index
+        model_cols_subset = model_cols[reg_vars]
+        
+        x = select(train_df, model_cols_subset)
+        y = train_df[, c(y_var)]
+        
+        reg_data = cbind(x,y)
+        reg_data = reg_data %>% drop_na() # drop rows w NA value
+        
+        x_test = select(test_df, model_cols_subset)
+        
+        performance_df_base = test_df[performance_cols]  # create shell for performance df
+        
+        # regression
+        x_clean = reg_data[model_cols_subset]
+        y_clean = reg_data[, !names(reg_data) %in% c('player_full_name',model_cols_subset)]
+        
+        reg = lm(unlist(y_clean) ~ 0 + ., data = x_clean)  # force intercept to zero
+        predicted_value = round(predict(reg, x_test), 1)
+        
+        # generate performance dataframe
+        performance_df_reg = cbind(performance_df_base, predicted_value)
+        performance_df_reg = cbind(performance_df_reg, ma_combos[j,])
+        performance_df = dplyr::bind_rows(performance_df, performance_df_reg)
+        
+        
+      }
+      
+    }
+    
+    min_days = min_days + 1
+    
+  }
+  
+  
+  
+  # =============================================================================
+  # evaluate model performance
+  # =============================================================================
+  
+  peformance_df_backup = copy(performance_df)
+  
+  # drop NA columns X1-X4
+  performance_df = performance_df[, !names(performance_df) %in% c("X1","X2","X3","X4")]
+  
+  performance_df_sub = data.frame(performance_df)
+  performance_df_sub$error = performance_df_sub$predicted_value - performance_df_sub$fp_bucket_next  # fantasy_points_next
+  performance_df_sub = performance_df_sub %>% drop_na(error) # drop rows w NA value
+  
+  paste(model_cols, "_ma", 3, sep="")
+  
+  groupby_cols = c(
+    model_cols, 
+    #paste(model_cols, "_ma", 3, sep=""),
+    #paste(model_cols, "_ma", 5, sep=""),
+    paste(model_cols, "_ma", 7, sep="")
+    #paste(model_cols, "_ma", 10, sep="")
+  )
+  
+  performance_df_sub[is.na(performance_df_sub)] = 0
+  
+  
+  # performance by ensemble of parameters
+  
+  model_perf = performance_df_sub %>%
+    group_by(across(all_of(groupby_cols))) %>%
+    summarize(error_avg = mean(error), error_std = sd(error), error_med = median(error))
+  
+  model_perf$sum_days_off = rowSums(model_perf[startsWith(names(model_perf), "days_off")])
+  #model_perf$sum_exit_velocity = rowSums(model_perf[startsWith(names(model_perf), "exit_velocity")])
+  #model_perf$sum_soft_hits = rowSums(model_perf[startsWith(names(model_perf), "soft_hits")])
+  #model_perf$sum_Pitches = rowSums(model_perf[startsWith(names(model_perf), "Pitches")])
+  #model_perf$sum_Balls = rowSums(model_perf[startsWith(names(model_perf), "Balls")])
+  #model_perf$sum_GDP = rowSums(model_perf[startsWith(names(model_perf), "GDP")])
+  model_perf$sum_RBI = rowSums(model_perf[startsWith(names(model_perf), "RBI")])
+  model_perf$sum_fantasy_points = rowSums(model_perf[startsWith(names(model_perf), "fantasy_points")])
+  model_perf$sum_fantasy_points_season = rowSums(model_perf[startsWith(names(model_perf), "fantasy_points_season")])
+  
+  
+  # performance by player
+  
+  player_perf = performance_df_sub %>%
+    group_by(PlayerName, Date) %>%
+    summarise_at(vars("fp_bucket_next","predicted_value","error"), mean)  # fantasy_points_next
+  
+  # TODO: 
+  
+  player_perf$threshold = t
+  
+  write.csv(player_perf, paste(file_output_path, player_type, "_", t, ".csv", sep=""), row.names=FALSE)
+  
+}
+
+# =============================================================================
+# input parameters
+# =============================================================================
+
+file_input_path <- "C:/Users/bradj/Documents/"
+file_output_path <- "C:/Users/bradj/Documents/"
+
+
+player_type = "pitcher"  # ["position","pitcher"]
+
+# =============================================================================
+# clean historical data
+# =============================================================================
+
+if (player_type == "position") {
+  file_today = "position_players"
+  file_hist = "season_history"
+} 
+if (player_type == "pitcher") {
+  file_today = "pitchers"
+  file_hist = "season_history_pitchers"
+}
+
+
+df_today = read_csv(paste(file_input_path, paste(file_today, ".csv", sep=""), sep=""))
+df = read_csv(paste(file_input_path, paste(file_hist, ".csv", sep=""), sep=""))
+
+
+df$player_full_name = gsub(".","",df$player_full_name, fixed=TRUE)  # replace periods in player names (e.g. A.J. > AJ) for mapping historical to current
+df$date = as.POSIXct(df$date, format = "%m/%d/%Y")  # convert date columns from text to date variable type
+#df$date = as.date(df$date)
+df = df %>% drop_na("date")
+df = df[with(df, order(player_full_name, date)),]  # sort game date by chronological order
+df = df[!duplicated(df[c("player_full_name","date")], fromLast=TRUE),]  # remove dupes - keep last (restatement?)
+df = df %>% select(-contains("fantasy_points_last"))  # remove fantasy_points_last columns (lags added later in script)
+
+# remove non-starting players
+if (player_type == "position") {
+  df = subset(df, df$AB != 0)
+  df = df[!grepl("PH", df$Pos), ]
+  df = df[!grepl("DH", df$Pos), ]
+} 
+if (player_type == "pitcher") {
+  df = subset(df, (df$W + df$L) != 0)
+  df = subset(df, df$IP > 1)
+}
+
+# get distribution of fantasy_points to inform threshold
+deciles = quantile(df$fantasy_points, probs = seq(.1, .9, by = .1), na.rm=TRUE)
+
+pct_60 = deciles[6]
+pct_80 = deciles[8]
+threshold_range = seq(pct_60, pct_80, by=1)
+
+# POSITION PLAYERS:
+# 10% 20% 30% 40% 50% 60% 70% 80% 90% 
+# 0   0   2   3   5   7   9  12  17 
+
+# PITCHERS:
+# 10% 20% 30% 40% 50% 60% 70% 80% 90% 
+
+# =============================================================================
+# add relevant features
+# =============================================================================
+
+# add days since last game
+df = df %>%
+  group_by(player_full_name) %>%
+  mutate(days_off = difftime(date, lag(date, default=first(date)), unit="day")) %>%
+  ungroup()
+
+df$days_off = replace(df$days_off, df$days_off < 1, NA)  # replace first game w NA
+df$days_off = as.integer(df$days_off)  # convert days to integer
+df$game_count = ave(seq_len(nrow(df)), df$player_full_name, FUN=seq_along)  # add game counter
+
+
+# columns for predictive model
+
+attribute_cols = c("player_full_name","date")
+
+if (player_type == "position") {
+  model_cols = c("days_off","RBI","fantasy_points","fantasy_points_season")  # removed fp_bucket, "exit_velocity","soft_hits","Pitches","Balls","GDP",
+} 
+if (player_type == "pitcher") {
+  model_cols = c("CG","IP","SO","Strikes","fantasy_points","fantasy_points_season")
+} # "batting_avg_on_balls_in_play","soft_hits", "tERA" removed
+
+df = df[, c(attribute_cols, model_cols)]
+
+
+# add fantasy points for next game
+df = df %>%
+  group_by(player_full_name) %>%
+  mutate(fantasy_points_next = lead(fantasy_points, default=first(fantasy_points)))
+
+# replace fantasy_points_next / fp_bucket_next for last game of each player w NA (this is what we are predicting)
+library(dplyr)
+library(zoo)
+
+df <- df %>%
+  group_by(player_full_name) %>%
+  mutate(fantasy_points_next = c(fantasy_points_next[-n()], NA)) %>%
+  ungroup()
+
+for (t in threshold_range) {
+  print(paste("threshold: ", t, Sys.time()))
+  
+  # Create fantasy point buckets
+  df$fp_bucket_next = ifelse(df$fantasy_points_next >= t, 1, 0)
+  
+  # Backup the original dataframe
+  df_backup <- df
+  
+  ma_periods <- c(7)
+  
+  # Add moving averages
+  for (i in model_cols) {
+    for (x in ma_periods) {
+      ma_col_name <- paste(i, "_ma", x, sep="")
+      print(ma_col_name)
+      
+      if (!ma_col_name %in% names(df)) {
+        df <- df %>%
+          group_by(player_full_name) %>%
+          mutate(!!ma_col_name := rollmean(get(i), k = x, fill = NA, align = 'right')) %>%
+          ungroup()
+      }
+    }
+  }
+
+  # Construct groupby_cols
+  groupby_cols <- c()
+  for (i in model_cols) {
+    for (x in ma_periods) {
+      ma_col_name <- paste(i, "_ma", x, sep="")
+      if (ma_col_name %in% names(df)) {
+        groupby_cols <- c(groupby_cols, ma_col_name)
+      } else {
+        warning(paste("Column does not exist:", ma_col_name))
+      }
+    }
+  }
+  
+  print("Moving average columns added:")
+  print(setdiff(names(df), names(df_backup)))
+
+  season_opening_date = min(df$date)
+  season_closing_date = max(df$date)
+  total_games = as.integer(season_closing_date - season_opening_date)
+  
+  if (player_type == "position") {
+    num_iterations = 10
+  } else if (player_type == "pitcher") {  # Corrected syntax here
+    num_iterations = 40
+  }
+
+  min_days = total_games - num_iterations
+    performance_cols = c(c("player_full_name", "date"), y_var)
+  performance_df = data.frame(matrix(nrow=0, ncol=length(c(performance_cols, 'predicted_value'))))
+  reg_model_cols = c("adj_R2", "RSE")
+  reg_model_df = data.frame()
+  
+  while (min_days < total_games) {
+    print(paste("min_days:", min_days, " | ", Sys.time()))
+      # Check if x and y have the same number of rows
+      print(paste("Number of rows in x:", nrow(x)))
+      print(paste("Number of rows in y:", nrow(y)))
+      print(paste("Number of rows in reg_data:", nrow(reg_data)))
+
+    
+    train_cutoff = season_opening_date + min_days
+    train_df = df[df$date <= train_cutoff, ]
+    next_day = min(df$date[df$date > train_cutoff], na.rm = TRUE)
+    test_df = df[df$date == next_day, ]
+    
+    if (nrow(test_df) == 0) {
+      print(paste("Skipping day due to no test data for date:", next_day))
+      min_days = min_days + 1
+      next
+    }
+    
+    N = length(model_cols)
+    vec = c(0, 1)
+    lst = lapply(numeric(N), function(x) vec)
+    ma_combos = data.frame(as.matrix(expand.grid(lst)))
+    colnames(ma_combos) = model_cols
+
+    for (k in c(1, ma_periods)) {
+      colnames(ma_combos) = paste(model_cols, "_ma", k, sep="")
+      ma_combos = ma_combos %>% 
+        rowwise %>% 
+        filter(sum(c_across(where(is.numeric))) > 3) %>%
+        ungroup()
+      
+    for (j in 1:nrow(ma_combos)) {
+    reg_vars = unlist(as.list(which(ma_combos[j,] == 1, arr.ind=TRUE)[, 'col']))
+    model_cols_subset = c(model_cols[reg_vars], "fp_bucket_next", "SO", "IP", "fantasy_points_season", "CG")  # Include dependent variable
+
+    # Ensure 'Strikes' is in the model columns subset
+    if (!"Strikes" %in% model_cols_subset) {
+        model_cols_subset <- c(model_cols_subset, "Strikes")
+        print("Added 'Strikes' to model columns subset.")
+    }
+
+    x = select(train_df, all_of(model_cols_subset))
+    y = train_df$fp_bucket_next  # Extract dependent variable
+
+    # Check for NA values and ensure x and y have the same number of rows
+    valid_rows = complete.cases(x, y)
+    x = x[valid_rows, ]
+    y = y[valid_rows]  # Corrected subsetting for y
+
+    reg_data = cbind(x, y)
+
+    x_test = select(test_df, all_of(model_cols_subset))
+        
+        performance_df_base = test_df[performance_cols]
+      # Run the regression
+      reg <- lm(fp_bucket_next ~ CG + IP + SO + Strikes, data = reg_data)
+      
+      # Predict using the regression model
+      predicted_value <- round(predict(reg, x_test), 1)
+      
+      # Generate performance dataframe
+      performance_df_reg <- cbind(performance_df_base, predicted_value)
+      performance_df_reg <- cbind(performance_df_reg, ma_combos[j,])
+      performance_df <- dplyr::bind_rows(performance_df, performance_df_reg)
+
+      }
+    }
+    
+    min_days = min_days + 1
+  }
+
+  print("Columns used for grouping:")
+  print(groupby_cols)
+
+  if (length(groupby_cols) == 0) {
+    stop("No valid columns found for grouping.")
+  }
+  
+  # =============================================================================
+  # evaluate model performance
+  # =============================================================================
+  
+  peformance_df_backup = copy(performance_df)
+  
+  # drop NA columns X1-X4
+  performance_df = performance_df[, !names(performance_df) %in% c("X1","X2","X3","X4")]
+  
+  performance_df_sub = data.frame(performance_df)
+  performance_df_sub$error = performance_df_sub$predicted_value - performance_df_sub$fp_bucket_next  # fantasy_points_next
+  performance_df_sub = performance_df_sub %>% drop_na(error) # drop rows w NA value
+  
+  paste(model_cols, "_ma", 3, sep="")
+  
+  groupby_cols <- c()
+  for (i in model_cols) {
+    for (x in ma_periods) {
+      ma_col_name <- paste(i, "_ma", x, sep="")
+      if (ma_col_name %in% names(performance_df_sub)) {
+        groupby_cols <- c(groupby_cols, ma_col_name)
+      }
+    }
+  }
+  
+  # Optional: Print to verify
+  print("Columns used for grouping:")
+  print(groupby_cols)
+  
+  # Before grouping, check if all columns in groupby_cols exist in performance_df_sub
+  if(!all(groupby_cols %in% names(performance_df_sub))) {
+    stop("One or more grouping columns do not exist in performance_df_sub.")
+  }
+  
+  performance_df_sub[is.na(performance_df_sub)] = 0
+  
+  model_perf <- performance_df_sub %>%
+    group_by(across(all_of(groupby_cols))) %>%
+    summarize(error_avg = mean(error), error_std = sd(error), error_med = median(error))
+
+  
+  model_perf$sum_days_off = rowSums(model_perf[startsWith(names(model_perf), "days_off")])
+  model_perf$sum_RBI = rowSums(model_perf[startsWith(names(model_perf), "RBI")])
+  model_perf$sum_fantasy_points = rowSums(model_perf[startsWith(names(model_perf), "fantasy_points")])
+  model_perf$sum_fantasy_points_season = rowSums(model_perf[startsWith(names(model_perf), "fantasy_points_season")])
+  
+  
+  pitcher_perf <- performance_df_sub %>%
+    group_by(player_full_name, date) %>%
+    summarize(across(c(fp_bucket_next, predicted_value, error), mean))
+  
+  pitcher_perf$threshold <- t
+  write.csv(pitcher_perf, paste(file_output_path, player_type, "_", t, ".csv", sep=""), row.names = FALSE)
+}
+
+# duplicate right?
+# replace fantasy_points_next / fp_bucket_next for last game of each player w NA (this is what we are predicting)
+library(dplyr)
+library(zoo)
+
+df <- df %>%
+  group_by(player_full_name) %>%
+  mutate(fantasy_points_next = c(fantasy_points_next[-n()], NA)) %>%
+  ungroup()
+# Assuming all necessary libraries are loaded and df is pre-loaded
+
+for (t in threshold_range) {
+  print(paste("Processing threshold:", t, Sys.time()))
+  
+  # Create fantasy point buckets
+  df$fp_bucket_next = ifelse(df$fantasy_points_next >= t, 1, 0)
+  
+  # Backup the original dataframe
+  df_backup = data.frame(df)
+  
+  # Add moving averages
+  ma_periods = c(7)
+  for (i in model_cols) {
+    for (x in ma_periods) {
+      ma_col_name <- paste(i, "_ma", x, sep="")
+      print(ma_col_name)
+      
+      if (!ma_col_name %in% names(df)) {
+        df <- df %>%
+          group_by(player_full_name) %>%
+          mutate(!!ma_col_name := rollmean(get(i), k = x, fill = NA, align = 'right')) %>%
+          ungroup()
+      }
+    }
+  }
+
+  # Time series cross-validation setup
+  season_opening_date = min(df$date)
+  season_closing_date = max(df$date)
+  total_games = as.integer(season_closing_date - season_opening_date)
+  
+  # Determine the number of iterations based on position type
+  min_days = total_games - (if (player_type == "position") {10} else {40})
+  
+  # Initialize performance data frame
+  performance_cols = c(c("player_full_name", "date"), y_var)
+  performance_df = data.frame(matrix(nrow = 0, ncol = length(performance_cols)))
+
+ while (min_days < total_games) {
+  print(paste("min_days:", min_days, " | ", Sys.time()))
+  
+  train_cutoff = season_opening_date + min_days
+
+  # Get the subset for training
+  train_df = df[df$date <= train_cutoff, ]
+
+  # Find the next available date in df after train_cutoff
+  next_day = min(df$date[df$date > train_cutoff])
+
+  # Check if next_day is NA (which means no more dates are available)
+  if (is.na(next_day)) {
+    print("No more dates available after train_cutoff")
+    break
+  }
+
+  # Get the subset for testing
+  test_df = df[df$date == next_day, ]
+  
+  # Check if test_df is empty
+  if (nrow(test_df) == 0) {
+    print(paste("Skipping day due to no test data for date:", next_day))
+    min_days = min_days + 1
+    next
+  }
+    N = length(model_cols)
+    ma_combos = expand.grid(replicate(N, c(0, 1), simplify = FALSE))
+
+    for (k in c(1, ma_periods)) {
+      colnames(ma_combos) <- ifelse(k == 1, model_cols, paste(model_cols, "_ma", k, sep = ""))
+      print(paste("Processing moving average period:", k))
+
+      for (j in 1:nrow(ma_combos)) {
+        reg_vars = unlist(as.list(which(ma_combos[j, ] == 1, arr.ind = TRUE)[, 'col']))
+        model_cols_subset = model_cols[reg_vars]
+
+        x = select(train_df, model_cols_subset)
+        y = train_df[, y_var, drop = FALSE]
+
+        reg_data = cbind(x, y) %>% drop_na()
+        x_test = select(test_df, model_cols_subset)
+
+        performance_df_base = test_df[performance_cols]
+        reg = lm(unlist(y) ~ 0 + ., data = reg_data)
+
+        if (length(reg$coefficients) == 0) {
+          print(paste("Regression failed for combo:", j))
+          next
+        }
+
+        predicted_value = round(predict(reg, x_test), 1)
+        performance_df_reg = cbind(performance_df_base, predicted_value)
+        
+        if (nrow(performance_df_reg) == 0) {
+          print(paste("performance_df_reg is empty for combo:", j))
+          next
+        }
+
+        performance_df = dplyr::bind_rows(performance_df, performance_df_reg)
+      }
+    }
+
+    min_days = min_days + 1
+  }
+
+  print(head(performance_df))
+
+  # Evaluate model performance
+  peformance_df_backup = copy(performance_df)
+  performance_df = performance_df[, !names(performance_df) %in% c("X1", "X2", "X3", "X4")]
+  
+  performance_df_sub = data.frame(performance_df)
+  performance_df_sub$error = performance_df_sub$predicted_value - performance_df_sub$fp_bucket_next
+  performance_df_sub = performance_df_sub %>% drop_na(error)
+
+  # Construct groupby_cols carefully
+  groupby_cols <- c()
+  for (col in model_cols) {
+    if (col %in% names(performance_df_sub)) {
+      groupby_cols <- c(groupby_cols, col)
+    }
+  
+    for (x in ma_periods) {
+      ma_col_name <- paste(col, "_ma", x, sep="")
+      if (ma_col_name %in% names(performance_df_sub)) {
+        groupby_cols <- c(groupby_cols, ma_col_name)
+      }
+    }
+  }
+
+  if (length(groupby_cols) == 0) {
+    stop("No valid columns found for grouping.")
+  }
+
+  model_perf <- performance_df_sub %>%
+    group_by(across(all_of(groupby_cols))) %>%
+    summarize(error_avg = mean(error), error_std = sd(error), error_med = median(error))
+
+  # Save performance by player
+  pitcher_perf <- performance_df_sub %>%
+    group_by(player_full_name, date) %>%
+    summarize(across(c(fp_bucket_next, predicted_value, error), mean))
+  
+  pitcher_perf$threshold <- t
+  
+  write.csv(pitcher_perf, paste(file_output_path, player_type, "_", t, ".csv", sep=""), row.names = FALSE)
+}
